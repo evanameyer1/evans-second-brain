@@ -159,6 +159,7 @@ export async function POST(request: Request) {
       },
     });
   } catch (error) {
+    console.error('POST /api/chat failed:', error);
     return new Response('An error occurred while processing your request!', {
       status: 404,
     });
