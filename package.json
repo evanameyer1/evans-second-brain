@@ -19,12 +19,14 @@
     "test": "export PLAYWRIGHT=True && pnpm exec playwright test --workers=4"
   },
   "dependencies": {
+    "@ai-sdk/google": "^1.2.10",
     "@ai-sdk/react": "^1.2.8",
     "@codemirror/lang-javascript": "^6.2.2",
     "@codemirror/lang-python": "^6.1.6",
     "@codemirror/state": "^6.5.0",
     "@codemirror/theme-one-dark": "^6.1.2",
     "@codemirror/view": "^6.35.3",
+    "@dqbd/tiktoken": "^1.0.20",
     "@google/generative-ai": "^0.24.0",
     "@pinecone-database/pinecone": "^5.1.1",
     "@radix-ui/react-alert-dialog": "^1.1.2",

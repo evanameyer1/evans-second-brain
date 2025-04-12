@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       '@ai-sdk/google':
-        specifier: ^1.2.8
+        specifier: ^1.2.10
         version: 1.2.10(zod@3.24.2)
       '@ai-sdk/react':
         specifier: ^1.2.8
@@ -29,6 +29,9 @@ importers:
       '@codemirror/view':
         specifier: ^6.35.3
         version: 6.36.4
+      '@dqbd/tiktoken':
+        specifier: ^1.0.20
+        version: 1.0.20
       '@google/generative-ai':
         specifier: ^0.24.0
         version: 0.24.0
@@ -399,6 +402,9 @@ packages:
 
   '@codemirror/view@6.36.4':
     resolution: {integrity: sha512-ZQ0V5ovw/miKEXTvjgzRyjnrk9TwriUB1k4R5p7uNnHR9Hus+D1SXHGdJshijEzPFjU25xea/7nhIeSqYFKdbA==}
+
+  '@dqbd/tiktoken@1.0.20':
+    resolution: {integrity: sha512-WsLzNYO1uzYOvIXunvwRcQObD4UsebirRnGzOuZc/x4oJ+0haEjdNxeeCfFaQami+Bai3u06QTt0/FWyYRsIhw==}
 
   '@drizzle-team/brocli@0.10.2':
     resolution: {integrity: sha512-z33Il7l5dKjUgGULTqBsQBQwckHh5AbIuxhdsIxDDiZAzBOrZO6q9ogcWC65kU382AfynTfgNumVcNIjuIua6w==}
@@ -4182,6 +4188,8 @@ snapshots:
       '@codemirror/state': 6.5.2
       style-mod: 4.1.2
       w3c-keyname: 2.2.8
+
+  '@dqbd/tiktoken@1.0.20': {}
 
   '@drizzle-team/brocli@0.10.2': {}
 

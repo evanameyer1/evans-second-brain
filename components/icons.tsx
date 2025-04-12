@@ -1172,3 +1172,32 @@ export const WarningIcon = ({ size = 16 }: { size?: number }) => {
     </svg>
   );
 };
+
+export const ReadwiseIcon = ({ size = 16 }: { size?: number }) => {
+  return (
+    <svg
+      height={size}
+      width={size}
+      viewBox="0 0 24 24"
+      strokeLinejoin="round"
+      style={{ color: 'currentcolor' }}
+    >
+      <path
+        d="M12 2L2 6V8L12 12L22 8V6L12 2Z"
+        fill="currentColor"
+      />
+      <path
+        d="M2 12L12 16L22 12"
+        stroke="currentColor"
+        strokeWidth="2"
+        fill="none"
+      />
+      <path
+        d="M2 16L12 20L22 16"
+        stroke="currentColor"
+        strokeWidth="2"
+        fill="none"
+      />
+    </svg>
+  );
+};
