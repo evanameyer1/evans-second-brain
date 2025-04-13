@@ -1,6 +1,17 @@
 import { Pinecone } from '@pinecone-database/pinecone';
 // Replace tiktoken with a simpler tokenization approach
 import 'dotenv/config';
+import { chunkTextWithOverlap } from './ai/chunker';
+import { toSparseVector } from './ai/sparse';
+import { stripStops } from './ai/stopwords';
+import { 
+  extractRakeKeywords, 
+  extractTfIdfKeywords, 
+  addDocumentToTfIdf, 
+  buildTfIdfModel,
+  boostTerm,
+  extractKeywords
+} from './ai/extract-keywords';
 
 // Update to use the correct Reader API endpoint
 const RW_API = 'https://readwise.io/api/v3/list/';
@@ -9,6 +20,9 @@ const pc = new Pinecone({
 });
 // Update to use reader-embeddings index
 const index = pc.index(process.env.PINECONE_INDEX || 'reader-embeddings');
+
+// Embedding model
+const EMBED_MODEL = 'llama-text-embed-v2';
 
 // Function to fetch all existing document IDs from Pinecone
 async function fetchExistingDocumentIds(): Promise<Set<string>> {
@@ -88,6 +102,7 @@ type ReaderDoc = {
   created_at: string;
   updated_at: string;
   source_url?: string;
+  tags?: string[];
 };
 
 // Function to extract text from HTML
@@ -177,7 +192,7 @@ function semanticChunksWithOverlap(
       const nextSentences = splitSentences(nextPara).slice(0, nextOverlap);
       const overlapText = nextSentences.length ? "\n\n" + nextSentences.join(" ") : "";
       out.push(buf.trim() + overlapText);
-      buf = ""; // reset, but don’t increment i
+      buf = ""; // reset, but don't increment i
     } else {
       buf = candidate;
       i++; // consume this paragraph
@@ -226,6 +241,300 @@ function chunkText(text: string, maxTokens = 512): string[] {
   return chunks;
 }
 
+async function processDocuments(docs: ReaderDoc[], existingIds: Set<string>): Promise<void> {
+  // First phase: collect all documents for TF-IDF corpus
+  console.log("Phase 1: Building TF-IDF corpus...");
+  for (const doc of docs) {
+    if (existingIds.has(doc.id)) continue;
+    
+    // Extract text for TF-IDF processing
+    let text = "";
+    if (doc.html_content) {
+      text = extractTextFromHtml(doc.html_content);
+    } else if (doc.content) {
+      text = doc.content;
+    } else {
+      continue; // Skip docs with no content
+    }
+    
+    // Add to TF-IDF corpus
+    addDocumentToTfIdf(doc.id, text);
+  }
+  
+  // Build the TF-IDF model
+  buildTfIdfModel();
+  
+  // Second phase: process each document with the built model
+  console.log("Phase 2: Creating Super-Headers and processing documents...");
+  for (const doc of docs) {
+    await processDocument(doc, existingIds);
+  }
+}
+
+async function processDocument(doc: ReaderDoc, existingIds: Set<string>): Promise<void> {
+  // Skip if already processed and not forcing update
+  if (existingIds.has(doc.id)) {
+    console.log(`Document ${doc.id} (${doc.title}) already exists, skipping`);
+    return;
+  }
+  
+  console.log(`Processing document: ${doc.title}`);
+  
+  // Extract text from HTML content or use plain content
+  let text = "";
+  if (doc.html_content) {
+    text = extractTextFromHtml(doc.html_content);
+  } else if (doc.content) {
+    text = doc.content;
+  } else {
+    console.log(`No content for ${doc.id}, skipping`);
+    return;
+  }
+  
+  // -------------------- SUPER-HEADER CREATION --------------------
+  
+  // 1. Basic components - title, author, summary
+  const title = doc.title || "";
+  const author = doc.author || "";
+  const summary = doc.summary || "";
+  
+  console.log(`Creating Super-Header for "${doc.title}"`);
+  
+  // 2. Get tags (if available)
+  const tags = doc.tags || [];
+  
+  // Debug tags
+  console.log('Tags before processing:', JSON.stringify(tags));
+  
+  // Extract tag strings - handle both string arrays and complex objects
+  let tagStrings: string[] = [];
+  if (Array.isArray(tags)) {
+    tagStrings = tags.map(tag => {
+      if (typeof tag === 'string') return tag;
+      if (typeof tag === 'object' && tag !== null) {
+        // If tag is an object, try to get a string representation
+        if ('name' in tag) return String((tag as any).name);
+        if ('id' in tag) return String((tag as any).id);
+        return String(Object.values(tag)[0] || '');
+      }
+      return String(tag);
+    });
+  }
+  
+  console.log('Tags after processing:', tagStrings);
+  const tagsText = tagStrings.length > 0 ? `Tags: ${tagStrings.join(' ')}` : '';
+  
+  if (tagStrings.length > 0) {
+    console.log(`Document has ${tagStrings.length} tags: ${tagStrings.join(', ')}`);
+  }
+  
+  // 3. Extract RAKE keywords and TF-IDF terms
+  const { rakeKeywords, tfidfKeywords, boostedText } = extractKeywords(doc.id, text);
+  
+  console.log(`Extracted ${rakeKeywords.length} RAKE keywords and ${tfidfKeywords.length} TF-IDF terms`);
+  
+  // Log some of the top terms
+  if (rakeKeywords.length > 0) {
+    console.log(`Top RAKE terms: ${rakeKeywords.slice(0, 5).map(k => k.term).join(', ')}`);
+  }
+  
+  if (tfidfKeywords.length > 0) {
+    console.log(`Top TF-IDF terms: ${tfidfKeywords.slice(0, 5).map(k => k.term).join(', ')}`);
+  }
+  
+  // 🔹 Step 1: Extract relevant fields (already done above)
+  
+  // 🔹 Step 2: Deduplicate and union key terms
+  const rakeTermsSet = new Set(rakeKeywords.map(k => k.term));
+  const tfidfTermsSet = new Set(tfidfKeywords.map(k => k.term));
+  
+  const dedupedRakeTerms = [...rakeTermsSet];
+  const dedupedTfidfTerms = [...tfidfTermsSet].filter(term => !rakeTermsSet.has(term));
+  
+  console.log(`After deduplication: ${dedupedRakeTerms.length} RAKE terms, ${dedupedTfidfTerms.length} unique TF-IDF terms`);
+  
+  // 🔹 Step 3: Format for dense embedding
+  const headerContent = [
+    `Title: ${title}`,
+    `Author: ${author}`,
+    tagsText ? `Tags: ${tagStrings.join(', ')}` : '',
+    summary ? `Summary: ${summary}` : '',
+    `RAKE Keywords: ${dedupedRakeTerms.join(', ')}`,
+    `TF-IDF Top Terms: ${dedupedTfidfTerms.join(', ')}`
+  ].filter(Boolean).join('\n\n');
+  
+  // Replace old superHeaderText with new structured format
+  const superHeaderText = headerContent;
+  
+  // Log the full header content
+  console.log(`Super-Header created (${superHeaderText.length} chars)`);
+  console.log('======== FULL HEADER CONTENT ========');
+  console.log(superHeaderText);
+  console.log('=====================================');
+  
+  // Create header embedding with the super-header text
+  const { data: headerEmbeddings } = await pc.inference.embed(
+    EMBED_MODEL,
+    [superHeaderText],
+    { input_type: 'passage' }
+  );
+  
+  // Extract vector values from embedding
+  const headerVector = Array.isArray(headerEmbeddings[0]) 
+    ? headerEmbeddings[0] 
+    : 'values' in headerEmbeddings[0]
+      ? (headerEmbeddings[0] as any).values
+      : [];
+  
+  // 🔹 Step 4: Build sparse vector from keywords with weights
+  // Create a sparse vector with proper weighting instead of term repetition
+  const sparseTermsMap = new Map<string, number>();
+  
+  // Add RAKE terms with their weights
+  for (const { term, weight } of rakeKeywords) {
+    sparseTermsMap.set(term, (sparseTermsMap.get(term) || 0) + (weight * 1.5)); // Boost RAKE terms
+  }
+  
+  // Add TF-IDF terms with their weights
+  for (const { term, weight } of tfidfKeywords) {
+    sparseTermsMap.set(term, (sparseTermsMap.get(term) || 0) + weight);
+  }
+  
+  // Create a weighted sparse vector
+  const sparseVector = toSparseVector(
+    [...sparseTermsMap.entries()]
+      .map(([term, weight]) => ({ term, weight }))
+      .sort((a, b) => b.weight - a.weight)
+      .slice(0, 100) // Limit to top 100 terms
+      .map(({ term }) => term)
+      .join(' ')
+  );
+  
+  // Enhance sparse vector with weighted terms
+  const enhancedSparseVector = enhanceSparseVector(
+    sparseVector,
+    [...rakeKeywords, ...tfidfKeywords]
+  );
+  
+  // 🔹 Step 5: Store in hybrid index
+  // Upsert header vector
+  await index.upsert([{
+    id: `${doc.id}-header`,
+    values: headerVector,
+    sparseValues: enhancedSparseVector,
+    metadata: {
+      doc_id: doc.id,
+      title: doc.title,
+      author: doc.author,
+      url: doc.url,
+      category: doc.category,
+      text: superHeaderText.slice(0, 1000),
+      summary: doc.summary || "",
+      tags: tagStrings,
+      header: true,
+      created_at: doc.created_at,
+    }
+  }]);
+  
+  // Create meaningful chunks with overlap
+  const chunks = chunkTextWithOverlap(text, 512, 2);
+  console.log(`Created ${chunks.length} chunks from document`);
+  
+  // Limit to 20 chunks per document to avoid rate limits
+  const chunkLimit = Math.min(chunks.length, 20);
+  
+  // Process chunks in batches
+  for (let i = 0; i < chunkLimit; i++) {
+    const chunkText = chunks[i];
+    console.log(`Processing chunk ${i+1}/${chunkLimit} (${chunkText.length} chars)`);
+    
+    // Create dense vector
+    const { data: chunkEmbeddings } = await pc.inference.embed(
+      EMBED_MODEL,
+      [chunkText],
+      { input_type: 'passage' }
+    );
+    
+    // Extract vector values
+    const chunkVector = Array.isArray(chunkEmbeddings[0]) 
+      ? chunkEmbeddings[0] 
+      : 'values' in chunkEmbeddings[0]
+        ? (chunkEmbeddings[0] as any).values
+        : [];
+    
+    // Create sparse vector
+    const chunkSparse = toSparseVector(chunkText);
+    
+    // Upsert chunk vector
+    await index.upsert([{
+      id: `${doc.id}-chunk-${i}`,
+      values: chunkVector,
+      sparseValues: chunkSparse,
+      metadata: {
+        doc_id: doc.id,
+        title: doc.title,
+        author: doc.author,
+        url: doc.url,
+        category: doc.category,
+        text: chunkText,
+        header: false,
+        chunk_id: i,
+        created_at: doc.created_at,
+      }
+    }]);
+    
+    // Add a small delay to avoid rate limits
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+}
+
+/**
+ * Enhance a sparse vector with term weights
+ * @param baseVector Basic sparse vector
+ * @param weightedTerms Array of terms with weights
+ * @returns Enhanced sparse vector
+ */
+function enhanceSparseVector(
+  baseVector: { indices: number[], values: number[] },
+  weightedTerms: Array<{term: string, weight: number}>
+): { indices: number[], values: number[] } {
+  // Create a map of term hashes to weights
+  const termWeights = new Map<number, number>();
+  
+  // Hash function should match the one in toSparseVector
+  const hashFn = (term: string): number => {
+    let hash = 0;
+    for (let i = 0; i < term.length; i++) {
+      hash = ((hash << 5) - hash) + term.charCodeAt(i);
+      hash |= 0; // Convert to 32bit integer
+    }
+    return Math.abs(hash);
+  };
+  
+  // Add weighted terms to the map
+  for (const { term, weight } of weightedTerms) {
+    const hash = hashFn(term);
+    termWeights.set(hash, weight);
+  }
+  
+  // Create a copy of the base vector
+  const enhancedVector = {
+    indices: [...baseVector.indices],
+    values: [...baseVector.values]
+  };
+  
+  // Apply weights to matching indices
+  for (let i = 0; i < enhancedVector.indices.length; i++) {
+    const index = enhancedVector.indices[i];
+    if (termWeights.has(index)) {
+      // Boost the weight
+      enhancedVector.values[i] *= termWeights.get(index) || 1;
+    }
+  }
+  
+  return enhancedVector;
+}
+
 export async function syncReadwise(updatedAfter?: string, forceUpdate = false): Promise<void> {
   // Track processed documents to avoid duplicates across all locations
   const processedDocIds = new Set<string>();
@@ -250,6 +559,9 @@ export async function syncReadwise(updatedAfter?: string, forceUpdate = false): 
     let documentsSkipped = 0;
     let documentsProcessed = 0;
     let chunksEmbedded = 0;
+    
+    // Collect all documents first
+    const allDocuments: ReaderDoc[] = [];
     
     // Process each location separately
     for (const location of locations) {
@@ -320,146 +632,22 @@ export async function syncReadwise(updatedAfter?: string, forceUpdate = false): 
         totalDocumentsReceived += batchSize;
         console.log(`Received ${batchSize} documents from Readwise Reader for ${location} (total across locations: ${totalDocumentsReceived})`);
 
-        // Process each document
-        for (const doc of results) {
-          // Skip if already processed in this run to avoid duplicates
-          if (processedDocIds.has(doc.id)) {
-            console.log(`Skipping duplicate document in this batch: ${doc.title} (${doc.id})`);
-            documentsSkipped++;
-            continue;
-          }
-          processedDocIds.add(doc.id);
-          
-          // Skip if document already exists in Pinecone and we're not forcing updates
-          if (!forceUpdate && existingDocIds.has(doc.id)) {
-            console.log(`Skipping existing document: ${doc.title} (${doc.id})`);
-            documentsSkipped++;
-            continue;
-          }
-          
-          console.log(`Processing document: ${doc.title || 'Untitled'} (${doc.category})`);
-          
-          // Extract text content from the document
-          let textContent = '';
-          
-          if (doc.html_content && doc.html_content.trim()) {
-            textContent = extractTextFromHtml(doc.html_content);
-            console.log(`Using HTML content (${doc.html_content.length} chars)`);
-          } else if (doc.content && doc.content.trim()) {
-            textContent = extractTextFromHtml(doc.content);
-            console.log(`Using content field (${doc.content.length} chars)`);
-          } else if (doc.summary && doc.summary.trim()) {
-            // Some PDFs come back with plain-text summary
-            textContent = doc.summary.trim();
-            console.log(`Using summary field (${doc.summary.length} chars)`);
-          } else {
-            console.log(`Document has no parsable content, skipping: ${doc.title}`);
-            console.log('Available fields:', Object.keys(doc).filter(key => doc[key as keyof ReaderDoc]));
-            documentsSkipped++;
-            continue;
-          }
-          
-          console.log(`Extracted ${textContent.length} characters of text`);
-          
-          // Skip if no text was extracted
-          if (!textContent || textContent.trim() === '') {
-            console.log(`No text could be extracted from document: ${doc.title}`);
-            documentsSkipped++;
-            continue;
-          }
-          
-          // Collect all chunks for this document
-          const documentChunks: { id: string, text: string, metadata: any }[] = [];
-          
-          // Chunk text
-          try {
-            const chunks = semanticChunksWithOverlap(textContent, 512, 1, 1);
-            console.log(`Split document into ${chunks.length} chunks`);
-            
-            for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-              const chunkText = chunks[chunkIndex];
-              
-              documentChunks.push({
-                id: `${doc.id}-${chunkIndex}`,
-                text: chunkText,
-                metadata: {
-                  doc_id: doc.id,
-                  title: doc.title,
-                  author: doc.author,
-                  source_url: doc.source_url || doc.url,
-                  category: doc.category,
-                  location: location, // Add location to metadata
-                  url: doc.url,
-                  created_at: doc.created_at,
-                  updated_at: doc.updated_at,
-                  chunk_index: chunkIndex,
-                  total_chunks: chunks.length,
-                  text: chunkText,
-                }
-              });
+        // Collect documents instead of processing immediately
+        if (results) {
+          for (const doc of results) {
+            // Skip if already processed in this run to avoid duplicates
+            if (processedDocIds.has(doc.id)) {
+              console.log(`Skipping duplicate document in this batch: ${doc.title} (${doc.id})`);
+              documentsSkipped++;
+              continue;
             }
-          } catch (error) {
-            console.error("Error processing document:", error);
-            documentsSkipped++;
-            continue;
-          }
-          
-          // Process in batches of 50 to avoid overloading the API
-          const BATCH_SIZE = 50;
-          for (let i = 0; i < documentChunks.length; i += BATCH_SIZE) {
-            const batch = documentChunks.slice(i, i + BATCH_SIZE);
+            processedDocIds.add(doc.id);
             
-            if (batch.length === 0) continue;
-            
-            try {
-              console.log(`Embedding batch of ${batch.length} chunks using Pinecone...`);
-              
-              // Generate embeddings using Pinecone's embedding service
-              const embeddingResponse = await pc.inference.embed(
-                "llama-text-embed-v2",
-                batch.map(item => item.text),
-                {
-                  input_type: "passage"
-                }
-              );
-              
-              // Log embedding info but not the actual vectors (too large)
-              console.log("\nEMBEDDING INFO:");
-              console.log(`Model used: ${embeddingResponse.model}`);
-              console.log(`Vector type: ${embeddingResponse.vectorType}`);
-              console.log(`Number of embeddings: ${embeddingResponse.data?.length || 0}`);
-              console.log(`Total tokens: ${embeddingResponse.usage?.totalTokens || 'unknown'}`);
-              
-              // Check that we have a valid embedding response
-              if (!embeddingResponse || !embeddingResponse.data || !Array.isArray(embeddingResponse.data)) {
-                console.error("Unexpected embedding response format:", embeddingResponse);
-                throw new Error("Invalid embedding response format");
-              }
-              
-              // Prepare vectors for upsert - use type assertion to handle the embedding structure
-              const vectors = batch.map((item, idx) => {
-                const embeddingData = embeddingResponse.data[idx] as any; // Type assertion to bypass TS error
-                return {
-                  id: item.id,
-                  values: embeddingData.values,
-                  metadata: item.metadata
-                };
-              });
-              
-              // Upsert the vectors
-              console.log(`Upserting ${vectors.length} vectors to Pinecone index`);
-              await index.upsert(vectors);
-              chunksEmbedded += vectors.length;
-              
-            } catch (error) {
-              console.error("Error generating embeddings or upserting vectors:", error);
-              // We don't skip the document on embedding error since some chunks might succeed
-            }
+            // Add to collection of documents
+            allDocuments.push(doc);
           }
-          
-          documentsProcessed++;
         }
-
+        
         if (!nextPageCursor) {
           console.log(`No more pages for location "${location}", moving to next location`);
           break;
@@ -471,6 +659,10 @@ export async function syncReadwise(updatedAfter?: string, forceUpdate = false): 
       // Location completion status
       console.log(`\n=== Completed location: ${location} ===\n`);
     }
+    
+    // Process all documents in batches with TF-IDF context
+    console.log(`\n=== PROCESSING ALL DOCUMENTS (${allDocuments.length}) ===\n`);
+    await processDocuments(allDocuments, existingDocIds);
     
     // Log final stats
     console.log("\n=== SYNC SUMMARY ===");

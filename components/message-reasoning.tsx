@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { ChevronDownIcon, LoaderIcon } from './icons';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Markdown } from './markdown';
+import { Markdown, NonMemoizedMarkdown } from './markdown';
 
 interface MessageReasoningProps {
   isLoading: boolean;
@@ -69,7 +69,7 @@ export function MessageReasoning({
             style={{ overflow: 'hidden' }}
             className="pl-4 text-zinc-600 dark:text-zinc-400 border-l flex flex-col gap-4"
           >
-            <Markdown>{reasoning}</Markdown>
+            <NonMemoizedMarkdown>{reasoning}</NonMemoizedMarkdown>
           </motion.div>
         )}
       </AnimatePresence>

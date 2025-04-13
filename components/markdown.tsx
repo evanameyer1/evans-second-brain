@@ -7,7 +7,21 @@ import { CodeBlock } from './code-block';
 const components: Partial<Components> = {
   // @ts-expect-error
   code: CodeBlock,
-  pre: ({ children }) => <>{children}</>,
+  pre: ({ children }) => <div className="block w-full">{children}</div>,
+  p: ({ node, children, ...props }) => {
+    // Check if the paragraph contains any block elements like pre, div, etc.
+    // If it does, render a div instead of a p to prevent invalid nesting
+    const containsBlockElements = React.Children.toArray(children).some(child => 
+      React.isValidElement(child) && 
+      ['pre', 'div', 'ol', 'ul', 'table'].includes(child.type as string)
+    );
+
+    return containsBlockElements ? (
+      <div {...props}>{children}</div>
+    ) : (
+      <p {...props}>{children}</p>
+    );
+  },
   ol: ({ node, children, ...props }) => {
     return (
       <ol className="list-decimal list-outside ml-4" {...props}>
@@ -95,7 +109,7 @@ const components: Partial<Components> = {
 
 const remarkPlugins = [remarkGfm];
 
-const NonMemoizedMarkdown = ({ children }: { children: string }) => {
+export const NonMemoizedMarkdown = ({ children }: { children: string }) => {
   return (
     <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
       {children}
