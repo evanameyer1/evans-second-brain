@@ -60,7 +60,7 @@ export function AppSidebar({ user }: { user: User | undefined }) {
               className="flex flex-row gap-3 items-center"
             >
               <span className="text-lg font-semibold px-2 hover:bg-muted rounded-md cursor-pointer">
-                Chatbot
+                Evan&apos;s Second Brain
               </span>
             </Link>
             <Tooltip>

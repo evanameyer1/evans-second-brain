@@ -12,6 +12,7 @@ import {
   getChatById,
   saveChat,
   saveMessages,
+  getMessagesByChatId,
 } from '@/lib/db/queries';
 import {
   generateUUID,
@@ -83,6 +84,47 @@ export async function POST(request: Request) {
       }
     }
 
+    // Retrieve all previous messages for context
+    console.log("Retrieving conversation history...");
+    const storedMessages = await getMessagesByChatId({ id });
+    console.log(`Retrieved ${storedMessages.length} stored messages for context`);
+    
+    // Convert stored DB messages to UI messages format if needed
+    function convertToUIMessages(messages: Array<any>): Array<UIMessage> {
+      return messages.map((message) => ({
+        id: message.id,
+        parts: message.parts as UIMessage['parts'],
+        role: message.role as UIMessage['role'],
+        content: '', // Note: content will soon be deprecated in @ai-sdk/react
+        createdAt: message.createdAt,
+        experimental_attachments: (message.attachments as Array<any>) ?? [],
+      }));
+    }
+    
+    const persistedMessages = convertToUIMessages(storedMessages);
+    
+    // Use the full conversation history for context if it exists
+    let contextMessages = messages;
+    if (persistedMessages.length > 0) {
+      console.log("Using persisted message history for context");
+      // Sort messages by createdAt to ensure proper order
+      contextMessages = persistedMessages.sort((a, b) => {
+        const dateA = a.createdAt instanceof Date ? a.createdAt : new Date(a.createdAt || 0);
+        const dateB = b.createdAt instanceof Date ? b.createdAt : new Date(b.createdAt || 0);
+        return dateA.getTime() - dateB.getTime();
+      });
+      
+      // Make sure the latest user message is included
+      // It might not be in the database yet since we just saved it
+      const latestMessageInHistory = contextMessages.find(msg => msg.id === userMessage.id);
+      if (!latestMessageInHistory) {
+        console.log("Adding current user message to history context");
+        contextMessages.push(userMessage);
+      }
+      
+      console.log(`Using ${contextMessages.length} messages for full conversation context`);
+    }
+
     console.log("Saving user message...");
     await saveMessages({
       messages: [
@@ -100,7 +142,7 @@ export async function POST(request: Request) {
 
     // Handle Readwise integration for readwise-only and readwise-blend modes
     let readwiseContext = '';
-    let enhancedMessages = [...messages];
+    let enhancedMessages = contextMessages; // Start with full context instead of just current messages
     let forceNoNotesResponse = false;
     
     if (selectedChatModel === 'readwise-only' || selectedChatModel === 'readwise-blend') {
@@ -152,7 +194,8 @@ export async function POST(request: Request) {
             console.log("No relevant notes found for readwise-blend mode - falling back to general knowledge");
             // Don't add any special message - let the model use its general knowledge
             readwiseContext = ""; // Empty context
-            enhancedMessages = [...messages]; // Just keep original messages
+            enhancedMessages = contextMessages; // Keep full conversation context
+            console.log(`Using ${enhancedMessages.length} messages with enhanced system prompt`);
           }
         } else {
           console.log(`Retrieved Readwise context (${result.readwiseContext.length} chars)`);
@@ -161,8 +204,8 @@ export async function POST(request: Request) {
           // Will be combined with the selected prompt later in the code
           console.log(`Readwise context retrieved (${readwiseContext.length} chars)`);
           
-          // Keep existing messages without adding a system message in the middle
-          enhancedMessages = [...messages];
+          // Keep existing messages including full conversation history
+          enhancedMessages = contextMessages;
           console.log(`Using ${enhancedMessages.length} messages with enhanced system prompt`);
         }
       } catch (error) {
@@ -241,6 +284,16 @@ export async function POST(request: Request) {
     // Select appropriate system prompt based on model
     let promptSystem = systemPrompt({ selectedChatModel });
     
+    // Add a conversation history context guideline
+    const conversationHistoryGuideline = `
+CONVERSATION HISTORY GUIDELINES:
+1. You have access to the COMPLETE conversation history between you and the user.
+2. Always build upon previous exchanges when responding to maintain continuity.
+3. If the user refers to something mentioned earlier, use that context in your response.
+4. When relevant, remind the user of information they've shared previously.
+5. Maintain a coherent conversation thread by referencing earlier topics or questions.
+`;
+    
     // Define enhanced versions of the prompts with proper formatting instructions
     const formattingInstructions = `
 CRITICAL FORMATTING REQUIREMENT:
@@ -255,9 +308,11 @@ When including code blocks in your response:
     
     // Update the prompts based on model and context
     if (selectedChatModel === 'readwise-only') {
-      promptSystem = readwiseOnlyPrompt + formattingInstructions;
+      promptSystem = readwiseOnlyPrompt + formattingInstructions + conversationHistoryGuideline;
     } else if (selectedChatModel === 'readwise-blend') {
-      promptSystem = readwiseBlendPrompt + formattingInstructions;
+      promptSystem = readwiseBlendPrompt + formattingInstructions + conversationHistoryGuideline;
+    } else {
+      promptSystem = promptSystem + conversationHistoryGuideline;
     }
     
     // If we have Readwise context, enhance the system prompt
@@ -305,7 +360,7 @@ Please answer the question normally without mentioning the absence of notes.`;
           system: promptSystem,
           messages: selectedChatModel === 'readwise-only' || selectedChatModel === 'readwise-blend' 
             ? enhancedMessages 
-            : messages,
+            : contextMessages,
           maxSteps: 5,
           experimental_activeTools: [], // No tools since we're simplifying to just chat-model
           experimental_transform: smoothStream({ chunking: 'word' }),

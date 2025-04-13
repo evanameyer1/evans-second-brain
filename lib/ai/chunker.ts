@@ -7,7 +7,7 @@
  */
 export function chunkTextWithOverlap(
   text: string,
-  maxTokens = 1536,
+  maxTokens = 2000,
   sentenceOverlap = 3
 ): string[] {
   // Split by paragraphs (one or more newlines)
