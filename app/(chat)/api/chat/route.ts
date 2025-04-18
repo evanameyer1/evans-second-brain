@@ -110,14 +110,25 @@ export async function POST(request: Request) {
 
     // Convert stored DB messages to UI messages format if needed
     function convertToUIMessages(messages: Array<any>): Array<UIMessage> {
-      return messages.map((message) => ({
-        id: message.id,
-        parts: message.parts as UIMessage['parts'],
-        role: message.role as UIMessage['role'],
-        content: '', // Note: content will soon be deprecated in @ai-sdk/react
-        createdAt: message.createdAt,
-        experimental_attachments: (message.attachments as Array<any>) ?? [],
-      }));
+      return messages.map((message) => {
+        // Ensure parts is properly formatted
+        const messageParts = message.parts ? message.parts : [];
+
+        // Convert empty parts array to text part if needed (for backward compatibility)
+        const formattedParts =
+          Array.isArray(messageParts) && messageParts.length === 0
+            ? [{ type: 'text', text: '' }]
+            : messageParts;
+
+        return {
+          id: message.id,
+          parts: formattedParts as UIMessage['parts'],
+          role: message.role as UIMessage['role'],
+          content: '', // Note: content will soon be deprecated in @ai-sdk/react
+          createdAt: message.createdAt,
+          experimental_attachments: (message.attachments as Array<any>) ?? [],
+        };
+      });
     }
 
     const persistedMessages = convertToUIMessages(storedMessages);
@@ -483,6 +494,23 @@ Please answer the question normally without mentioning the absence of notes.`;
                     responseMessages: response.messages,
                   });
                   logWithTimestamp('Response messages appended');
+
+                  // Log parts structure for debugging
+                  logWithTimestamp('Assistant message parts structure', {
+                    partsType: typeof assistantMessage.parts,
+                    isArray: Array.isArray(assistantMessage.parts),
+                    partsLength: Array.isArray(assistantMessage.parts)
+                      ? assistantMessage.parts.length
+                      : 0,
+                    samplePart:
+                      Array.isArray(assistantMessage.parts) &&
+                      assistantMessage.parts.length > 0
+                        ? JSON.stringify(assistantMessage.parts[0]).substring(
+                            0,
+                            100,
+                          )
+                        : 'No parts',
+                  });
 
                   logWithTimestamp('Saving assistant message to database');
                   await saveMessages({

@@ -6,8 +6,8 @@ import { Chat } from '@/components/chat';
 import { getChatById, getMessagesByChatId } from '@/lib/db/queries';
 import { DataStreamHandler } from '@/components/data-stream-handler';
 import { DEFAULT_CHAT_MODEL } from '@/lib/ai/models';
-import { DBMessage } from '@/lib/db/schema';
-import { Attachment, UIMessage } from 'ai';
+import type { DBMessage } from '@/lib/db/schema';
+import type { Attachment, UIMessage } from 'ai';
 
 export default async function Page(props: { params: Promise<{ id: string }> }) {
   const params = await props.params;
@@ -35,16 +35,27 @@ export default async function Page(props: { params: Promise<{ id: string }> }) {
   });
 
   function convertToUIMessages(messages: Array<DBMessage>): Array<UIMessage> {
-    return messages.map((message) => ({
-      id: message.id,
-      parts: message.parts as UIMessage['parts'],
-      role: message.role as UIMessage['role'],
-      // Note: content will soon be deprecated in @ai-sdk/react
-      content: '',
-      createdAt: message.createdAt,
-      experimental_attachments:
-        (message.attachments as Array<Attachment>) ?? [],
-    }));
+    return messages.map((message) => {
+      // Ensure parts is properly formatted
+      const messageParts = message.parts ? message.parts : [];
+
+      // Convert empty parts array to text part if needed (for backward compatibility)
+      const formattedParts =
+        Array.isArray(messageParts) && messageParts.length === 0
+          ? [{ type: 'text', text: '' }]
+          : messageParts;
+
+      return {
+        id: message.id,
+        parts: formattedParts as UIMessage['parts'],
+        role: message.role as UIMessage['role'],
+        // Note: content will soon be deprecated in @ai-sdk/react
+        content: '',
+        createdAt: message.createdAt,
+        experimental_attachments:
+          (message.attachments as Array<Attachment>) ?? [],
+      };
+    });
   }
 
   const cookieStore = await cookies();
