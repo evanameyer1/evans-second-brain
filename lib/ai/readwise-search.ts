@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { Pinecone } from '@pinecone-database/pinecone';
 import { stripStops } from './stopwords';
 import { toSparseVector } from './sparse';
@@ -6,6 +7,19 @@ import { generateEmbeddings } from './embeddings';
 
 // Initialize Google Generative AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+
+// Log environment variable status for debugging
+if (!process.env.GEMINI_API_KEY) {
+  console.error('GEMINI_API_KEY is missing in environment');
+}
+
+if (!process.env.PINECONE_API_KEY) {
+  console.error('PINECONE_API_KEY is missing in environment');
+}
+
+if (!process.env.PINECONE_INDEX) {
+  console.error('PINECONE_INDEX is missing in environment');
+}
 
 // Initialize Pinecone client
 const pc = new Pinecone({
@@ -171,7 +185,16 @@ export async function hybridSearch(
   minScore = 10,
 ): Promise<ReadwiseMatch[]> {
   try {
-    logWithTimestamp('Starting hybrid search', { query, topK, minScore });
+    logWithTimestamp('Starting hybrid search', {
+      query,
+      topK,
+      minScore,
+      environment: process.env.NODE_ENV,
+      geminiKeyExists: Boolean(process.env.GEMINI_API_KEY),
+      pineconeKeyExists: Boolean(process.env.PINECONE_API_KEY),
+      pineconeIndexExists: Boolean(process.env.PINECONE_INDEX),
+      pineconeIndex: process.env.PINECONE_INDEX,
+    });
 
     // Step 1: Enhance query with Gemini
     logWithTimestamp('Step 1: Query Enhancement');
@@ -199,19 +222,31 @@ export async function hybridSearch(
 
     // Step 2: Header search to find relevant document IDs
     logWithTimestamp('Step 2: Header Search (Document Filtering)');
-    const headerResponse = await index.query({
-      vector: denseQueryValues,
-      sparseVector: sparseQuery,
-      topK: 8,
-      includeMetadata: true,
-      filter: { header: { $eq: true } },
-    });
+    let headerResponse: any;
+    try {
+      headerResponse = await index.query({
+        vector: denseQueryValues,
+        sparseVector: sparseQuery,
+        topK: 8,
+        includeMetadata: true,
+        filter: { header: { $eq: true } },
+      });
+
+      logWithTimestamp('Header query successful', {
+        matchesCount: headerResponse.matches?.length || 0,
+      });
+    } catch (error: unknown) {
+      logWithTimestamp('Error in header search', { error });
+      throw new Error(
+        `Pinecone header search failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
 
     // Extract document IDs from header search with score >= threshold
     const headerThreshold = 5;
     const docIds = headerResponse.matches
-      ?.filter((match) => match.score && match.score >= headerThreshold)
-      .map((match) => match.metadata?.doc_id)
+      ?.filter((match: any) => match.score && match.score >= headerThreshold)
+      .map((match: any) => match.metadata?.doc_id)
       .filter(Boolean) as string[];
 
     logWithTimestamp('Header search completed', {
@@ -226,27 +261,35 @@ export async function hybridSearch(
 
     // Step 3: Chunk search within identified documents
     logWithTimestamp('Step 3: Fine-grained Chunk Search');
-    const chunkResponse = await index.query({
-      vector: denseQueryValues,
-      sparseVector: sparseQuery,
-      topK: topK * 2,
-      includeMetadata: true,
-      filter: {
-        doc_id: { $in: docIds },
-        header: { $eq: false },
-      },
-    });
+    let chunkResponse: any;
+    try {
+      chunkResponse = await index.query({
+        vector: denseQueryValues,
+        sparseVector: sparseQuery,
+        topK: topK * 2,
+        includeMetadata: true,
+        filter: {
+          doc_id: { $in: docIds },
+          header: { $eq: false },
+        },
+      });
 
-    logWithTimestamp('Chunk search completed', {
-      totalChunks: chunkResponse.matches?.length,
-    });
+      logWithTimestamp('Chunk query successful', {
+        matchesCount: chunkResponse.matches?.length || 0,
+      });
+    } catch (error: unknown) {
+      logWithTimestamp('Error in chunk search', { error });
+      throw new Error(
+        `Pinecone chunk search failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
 
     // Step 4: Process and filter chunk results
     logWithTimestamp('Step 4: Result Processing and Filtering');
     const matches = (chunkResponse.matches || [])
-      .filter((match) => match.score && match.score >= minScore)
+      .filter((match: any) => match.score && match.score >= minScore)
       .slice(0, topK)
-      .map((match) => ({
+      .map((match: any) => ({
         score: match.score || 0,
         title: String(match.metadata?.title || ''),
         text: String(match.metadata?.text || ''),
