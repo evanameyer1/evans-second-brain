@@ -1,29 +1,38 @@
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 import { stripStops } from './stopwords';
 
 /**
- * Create a sparse vector from text with token frequencies
- * @param text Text to convert to sparse vector
- * @returns Sparse vector in Pinecone format (indices and values)
+ * Create a sparse vector from text with token frequencies,
+ * but only keep the top `maxTerms` most frequent tokens.
+ *
+ * @param text     Text to convert to sparse vector
+ * @param maxTerms Maximum number of token-terms to include (default: 1536)
+ * @returns        Sparse vector in Pinecone format (indices and values)
  */
-export function toSparseVector(text: string) {
+export function toSparseVector(
+  text: string,
+  maxTerms = 1536,
+): { indices: number[]; values: number[] } {
   const freq: Record<number, number> = {};
-  
-  // Split on whitespace after removing stop words
-  for (const tok of stripStops(text).split(' ')) {
-    if (!tok) continue; // Skip empty tokens
-    
-    // Hash the token to get a numeric ID
+
+  // Build raw token frequencies
+  for (const tok of stripStops(text).split(/\s+/)) {
+    if (!tok) continue;
     const id = hash(tok);
-    
-    // Increment the frequency count
     freq[id] = (freq[id] ?? 0) + 1;
   }
-  
-  return {
-    indices: Object.keys(freq).map(Number),
-    values: Object.values(freq),
-  };
+
+  // Sort entries by descending count, take top maxTerms
+  const top = Object.entries(freq)
+    .map(([id, count]) => ({ id: Number(id), count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, maxTerms);
+
+  // Split into parallel arrays
+  const indices = top.map((e) => e.id);
+  const values = top.map((e) => e.count);
+
+  return { indices, values };
 }
 
 /**
@@ -33,4 +42,4 @@ export function toSparseVector(text: string) {
  */
 function hash(token: string): number {
   return crypto.createHash('md5').update(token).digest().readUInt32BE(0);
-} 
+}

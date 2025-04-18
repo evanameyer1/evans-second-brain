@@ -41,7 +41,7 @@ export interface ChatHistory {
   hasMore: boolean;
 }
 
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 30;
 
 const groupChatsByDate = (chats: Chat[]): GroupedChats => {
   const now = new Date();

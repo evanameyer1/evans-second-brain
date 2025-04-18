@@ -2,26 +2,34 @@ import { Pinecone } from '@pinecone-database/pinecone';
 import { stripStops } from './stopwords';
 import { toSparseVector } from './sparse';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { generateEmbeddings } from './embeddings';
 
 // Initialize Google Generative AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-// Embedding model
-const EMBED_MODEL = 'llama-text-embed-v2';
-
 // Initialize Pinecone client
 const pc = new Pinecone({
-  apiKey: process.env.PINECONE_API_KEY!,
+  apiKey: process.env.PINECONE_API_KEY || '',
 });
 
 // Get index
 const index = pc.index(process.env.PINECONE_INDEX || 'reader-embeddings');
+
+// Helper function for timestamped logging
+function logWithTimestamp(message: string, data?: any) {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${message}`);
+  if (data) {
+    console.log(`[${timestamp}] Data:`, data);
+  }
+}
 
 interface ReadwiseMatch {
   score: number;
   title: string;
   text: string;
   docId?: string;
+  url?: string;
 }
 
 /**
@@ -31,7 +39,8 @@ interface ReadwiseMatch {
  */
 async function generateEnhancedQuery(rawQuery: string): Promise<string> {
   try {
-    console.log("Calling Gemini to enhance query...");
+    logWithTimestamp('Starting query enhancement with Gemini', { rawQuery });
+
     // Create the prompt template
     const prompt = `
       INSTRUCTION: You must directly process the following user query. Do not respond with "I'm ready" or similar messages.
@@ -94,70 +103,54 @@ async function generateEnhancedQuery(rawQuery: string): Promise<string> {
     `;
 
     // Call Gemini
-    console.log("Sending prompt to Gemini model...");
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    logWithTimestamp('Sending prompt to Gemini model');
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-2.5-pro-exp-03-25',
+    });
     const result = await model.generateContent(prompt);
     const rawResponse = result.response.text();
-    
-    console.log("=== RAW GEMINI RESPONSE ===");
-    console.log(rawResponse);
-    console.log("===========================");
+
+    logWithTimestamp('Received response from Gemini', { rawResponse });
 
     // Safely extract structured JSON block using regex
     const jsonMatch = rawResponse.match(/\{[\s\S]*?\}/);
     if (!jsonMatch) {
-      console.error("Could not find JSON block in Gemini response.");
+      logWithTimestamp('Error: Could not find JSON block in Gemini response');
       return rawQuery;
     }
-    
-    console.log("=== EXTRACTED JSON BLOCK ===");
-    console.log(jsonMatch[0]);
-    console.log("============================");
+
+    logWithTimestamp('Extracted JSON block from response');
 
     // Normalize quotes and parse
     try {
       const normalizedJson = jsonMatch[0].replace(/[""]|["]/g, '"');
-      console.log("=== NORMALIZED JSON ===");
-      console.log(normalizedJson);
-      console.log("=======================");
-      
       const parsed = JSON.parse(normalizedJson);
-      
-      console.log("=== PARSED JSON ===");
-      console.log(JSON.stringify(parsed, null, 2));
-      console.log("===================");
 
-      const optimizedQuery = parsed["Optimized Query"]?.trim();
-      const relatedTopics = (parsed["Related Topics"] || []).join(", ");
-      const tags = (parsed["Tags"] || []).join(", ");
+      const optimizedQuery = parsed['Optimized Query']?.trim();
+      const relatedTopics = (parsed['Related Topics'] || []).join(', ');
+      const tags = parsed.Tags?.join(', ') || '';
 
       if (!optimizedQuery) {
-        console.warn("Missing optimized query. Falling back to raw query.");
+        logWithTimestamp(
+          'Warning: Missing optimized query, falling back to raw query',
+        );
         return rawQuery;
       }
 
       const enhancedQueryText = [
         `Optimized Query: ${optimizedQuery}`,
         `Related Topics: ${relatedTopics}`,
-        `Tags: ${tags}`
-      ].join("\n\n");
-      
-      console.log("=== FINAL ENHANCED QUERY ===");
-      console.log(enhancedQueryText);
-      console.log("============================");
-      
+        `Tags: ${tags}`,
+      ].join('\n\n');
+
+      logWithTimestamp('Successfully generated enhanced query');
       return enhancedQueryText;
     } catch (jsonError) {
-      console.error("JSON parsing error:", jsonError);
-      console.error("Failed to parse JSON:", jsonMatch[0]);
+      logWithTimestamp('Error parsing JSON response', { error: jsonError });
       return rawQuery;
     }
   } catch (error) {
-    console.error("Error generating enhanced query with Gemini:", error);
-    if (error instanceof Error) {
-      console.error("Error details:", error.message);
-      console.error("Error stack:", error.stack);
-    }
+    logWithTimestamp('Error in generateEnhancedQuery', { error });
     return rawQuery;
   }
 }
@@ -166,7 +159,7 @@ async function generateEnhancedQuery(rawQuery: string): Promise<string> {
  * Two-stage hybrid retrieval for Readwise content
  * 1. Header search to identify relevant documents
  * 2. Chunk search within those documents to find specific content
- * 
+ *
  * @param query User query
  * @param topK Number of results to return (default: 12)
  * @param minScore Minimum similarity score for results (default: 0.7)
@@ -174,149 +167,100 @@ async function generateEnhancedQuery(rawQuery: string): Promise<string> {
  */
 export async function hybridSearch(
   query: string,
-  topK: number = 12,
-  minScore: number = 0.7
+  topK = 20,
+  minScore = 10,
 ): Promise<ReadwiseMatch[]> {
   try {
-    console.log(`Hybrid search for query: "${query}"`);
-    
-    // Log search parameters
-    console.log("\n===== SEARCH PARAMETERS =====");
-    console.log(`Minimum score threshold for chunks: ${minScore}`);
-    console.log(`Minimum score threshold for headers: 10.0`);
-    console.log(`Maximum results to return: ${topK}`);
-    console.log(`Index: ${process.env.PINECONE_INDEX || 'reader-embeddings'}`);
-    console.log(`Embedding model: ${EMBED_MODEL}`);
-    console.log("=============================\n");
-    
+    logWithTimestamp('Starting hybrid search', { query, topK, minScore });
+
     // Step 1: Enhance query with Gemini
-    console.log("STEP 1: Query Enhancement");
+    logWithTimestamp('Step 1: Query Enhancement');
     const optimizedQuery = await generateEnhancedQuery(query);
-    console.log(`Gemini-enhanced query: "${optimizedQuery}"`);
-    
+    logWithTimestamp('Query enhancement completed', { optimizedQuery });
+
     // Clean query by removing stopwords
     const cleanedQuery = stripStops(optimizedQuery);
-    console.log(`Cleaned query: "${cleanedQuery}"`);
-    
+    logWithTimestamp('Query cleaned', { cleanedQuery });
+
     // Get dense embedding from Pinecone's embedding API
-    console.log(`Generating dense embedding with ${EMBED_MODEL}`);
-    const { data: embeddings } = await pc.inference.embed(
-      EMBED_MODEL,
-      [cleanedQuery],
-      { input_type: 'query' }
-    );
-    
-    // Extract vector values from embedding
-    const denseQueryValues = Array.isArray(embeddings[0]) 
-      ? embeddings[0] 
-      : 'values' in embeddings[0]
-        ? (embeddings[0] as any).values
-        : [];
-        
-    console.log(`Dense embedding created, dimension: ${denseQueryValues.length}`);
-    
+    const embeddings = await generateEmbeddings(cleanedQuery, 1536);
+    const denseQueryValues = embeddings;
+
+    logWithTimestamp('Generated embeddings', {
+      dimension: denseQueryValues.length,
+      isEmpty: denseQueryValues.length === 0,
+    });
+
     // Create sparse vector for the query
     const sparseQuery = toSparseVector(cleanedQuery);
-    console.log(`Sparse vector created with ${sparseQuery.indices.length} tokens`);
-    
+    logWithTimestamp('Created sparse vector', {
+      tokenCount: sparseQuery.indices.length,
+    });
+
     // Step 2: Header search to find relevant document IDs
-    console.log("\nSTEP 2: Header Search (Document Filtering)");
+    logWithTimestamp('Step 2: Header Search (Document Filtering)');
     const headerResponse = await index.query({
       vector: denseQueryValues,
       sparseVector: sparseQuery,
-      topK: 20,
+      topK: 8,
       includeMetadata: true,
-      filter: { header: { $eq: true } }
+      filter: { header: { $eq: true } },
     });
-    
+
     // Extract document IDs from header search with score >= threshold
-    const headerThreshold = 1.0;
+    const headerThreshold = 5;
     const docIds = headerResponse.matches
-      ?.filter(match => match.score && match.score >= headerThreshold)
-      .map(match => match.metadata?.doc_id)
+      ?.filter((match) => match.score && match.score >= headerThreshold)
+      .map((match) => match.metadata?.doc_id)
       .filter(Boolean) as string[];
-    
-    console.log(`Found ${docIds.length} relevant document IDs with score >= ${headerThreshold}`);
-    
-    // Log the header matches with their scores for debugging
-    console.log("\n===== ALL DOCUMENT HEADERS WITH SCORES =====");
-    headerResponse.matches?.forEach((match, idx) => {
-      const score = match.score || 0;
-      const isRelevant = score >= headerThreshold;
-      const docId = match.metadata?.doc_id || 'unknown';
-      const title = match.metadata?.title || 'Untitled';
-      
-      console.log(
-        `[${idx+1}] ${isRelevant ? '✓' : '✗'} Score: ${score.toFixed(4)} | ` +
-        `Doc ID: ${docId} | Title: "${title}"`
-      );
+
+    logWithTimestamp('Header search completed', {
+      foundDocuments: docIds.length,
+      threshold: headerThreshold,
     });
-    console.log("===========================================\n");
-    
+
     if (!docIds.length) {
-      console.log(`No relevant documents found, returning empty result`);
+      logWithTimestamp('No relevant documents found, returning empty result');
       return [];
     }
-    
+
     // Step 3: Chunk search within identified documents
-    console.log("\nSTEP 3: Fine-grained Chunk Search");
+    logWithTimestamp('Step 3: Fine-grained Chunk Search');
     const chunkResponse = await index.query({
       vector: denseQueryValues,
       sparseVector: sparseQuery,
-      topK: topK * 2, // Request more to allow for filtering
+      topK: topK * 2,
       includeMetadata: true,
-      filter: { 
+      filter: {
         doc_id: { $in: docIds },
-        header: { $eq: false }
-      }
+        header: { $eq: false },
+      },
     });
-    
-    // Log all chunks with their scores
-    console.log("\n===== ALL CHUNKS WITH SCORES =====");
-    chunkResponse.matches?.forEach((match, idx) => {
-      const score = match.score || 0;
-      const isSelected = score >= minScore && idx < topK;
-      const title = match.metadata?.title || 'Untitled';
-      const docId = match.metadata?.doc_id || 'unknown';
-      const preview = match.metadata?.text 
-        ? String(match.metadata.text).substring(0, 50).trim() + "..." 
-        : "No text";
-      
-      console.log(
-        `[${idx+1}] ${isSelected ? '✓' : '✗'} Score: ${score.toFixed(4)} | ` +
-        `Doc ID: ${docId} | Title: "${title}"`
-      );
-      console.log(`    Preview: "${preview}"`);
+
+    logWithTimestamp('Chunk search completed', {
+      totalChunks: chunkResponse.matches?.length,
     });
-    console.log("==================================\n");
-    
+
     // Step 4: Process and filter chunk results
-    console.log("\nSTEP 4: Result Processing and Filtering");
+    logWithTimestamp('Step 4: Result Processing and Filtering');
     const matches = (chunkResponse.matches || [])
-      .filter(match => match.score && match.score >= minScore)
-      .slice(0, topK) // Limit to requested number of results
-      .map(match => ({
+      .filter((match) => match.score && match.score >= minScore)
+      .slice(0, topK)
+      .map((match) => ({
         score: match.score || 0,
-        title: String(match.metadata?.title || ""),
-        text: String(match.metadata?.text || ""),
-        docId: String(match.metadata?.doc_id || "")
+        title: String(match.metadata?.title || ''),
+        text: String(match.metadata?.text || ''),
+        docId: String(match.metadata?.doc_id || ''),
+        url: String(match.metadata?.url || ''),
       }));
-    
-    console.log(`Found ${matches.length} matching chunks after filtering`);
-    
-    // Log the final selected chunks with scores
-    console.log("\n===== SELECTED CHUNKS =====");
-    matches.forEach((match, i) => {
-      console.log(`[${i+1}] Score: ${match.score.toFixed(4)} | Title: "${match.title}"`);
-      console.log(`    Preview: "${match.text.substring(0, 100).trim()}..."`);
-      console.log('');
+
+    logWithTimestamp('Search completed successfully', {
+      finalMatches: matches.length,
     });
-    console.log("===========================\n");
-    
+
     return matches;
-    
   } catch (error) {
-    console.error("Error in hybrid search:", error);
+    logWithTimestamp('Error in hybrid search', { error });
     throw error;
   }
 }
@@ -326,18 +270,25 @@ export async function hybridSearch(
  * @param matches Array of retrieved matches
  * @returns Formatted string with context and citations
  */
-export function formatReadwiseContext(matches: ReadwiseMatch[]): { 
-  readwiseContext: string; 
+export function formatReadwiseContext(matches: ReadwiseMatch[]): {
+  readwiseContext: string;
   hasSources: boolean;
 } {
+  logWithTimestamp('Starting context formatting', {
+    matchCount: matches.length,
+  });
+
   if (!matches.length) {
-    return { readwiseContext: "", hasSources: false };
+    logWithTimestamp('No matches to format, returning empty context');
+    return { readwiseContext: '', hasSources: false };
   }
-  
-  // Format each chunk with proper markdown
-  const excerpts = matches.map(match => {
+
+  // Create a map of abbreviated titles to full titles for reference
+  const titleMap = new Map<string, string>();
+
+  // Format each chunk with the new format
+  const excerpts = matches.map((match) => {
     // Process text to ensure proper markdown formatting
-    // Especially for code blocks to avoid nesting issues
     const processedText = match.text
       // Ensure code blocks have proper line breaks
       .replace(/```/g, '\n\n```')
@@ -349,25 +300,38 @@ export function formatReadwiseContext(matches: ReadwiseMatch[]): {
       .replace(/<pre>/g, '\n\n<pre>')
       .replace(/<\/pre>/g, '</pre>\n\n')
       // Ensure headings have proper spacing
-      .replace(/#+\s+/g, match => `\n\n${match}`);
-    
-    return `### ${match.title}\n\n${processedText}`;
+      .replace(/#+\s+/g, (match) => `\n\n${match}`);
+
+    // Create abbreviated title for citation
+    const abbreviatedTitle =
+      match.title.length > 12
+        ? `${match.title.substring(0, 12)}...`
+        : match.title;
+
+    // Store the mapping
+    titleMap.set(abbreviatedTitle, match.title);
+
+    return `Document Title: ${match.title}\nIn-Text Citation: [${abbreviatedTitle}]\nDocument URL: ${match.url || 'N/A'}\nExcerpt: ${processedText}\n`;
   });
-  
+
   // Build context string
-  const contextText = excerpts.join("\n\n");
-  
-  // Extract unique source titles for citation
-  const sources = [...new Set(matches.map(match => match.title))];
-  
-  // Add source citations in markdown format
-  const sourcesBlock = sources.length > 0 
-    ? "\n\n## Sources\n" + sources.map(title => `- ${title}`).join("\n")
-    : "";
-  
+  const contextText = excerpts.join('\n');
+
+  // Add source citations in markdown format using full titles
+  const sourcesBlock =
+    titleMap.size > 0
+      ? `\n\n## Sources\n${Array.from(titleMap.values())
+          .map((title) => `- ${title}`)
+          .join('\n')}`
+      : '';
+
+  logWithTimestamp('Context formatting completed', {
+    hasSources: titleMap.size > 0,
+  });
+
   return {
     readwiseContext: contextText + sourcesBlock,
-    hasSources: sources.length > 0
+    hasSources: titleMap.size > 0,
   };
 }
 
@@ -377,26 +341,25 @@ export function formatReadwiseContext(matches: ReadwiseMatch[]): {
  */
 export async function testGeminiConnection(): Promise<boolean> {
   try {
-    console.log("Testing Gemini API connection...");
-    console.log(`API Key exists: ${Boolean(process.env.GEMINI_API_KEY)}`);
-    console.log(`API Key starts with: ${process.env.GEMINI_API_KEY?.substring(0, 5)}...`);
-    
+    logWithTimestamp('Testing Gemini API connection');
+    logWithTimestamp('API Key status', {
+      exists: Boolean(process.env.GEMINI_API_KEY),
+      keyPrefix: process.env.GEMINI_API_KEY?.substring(0, 5),
+    });
+
     // Simple test prompt
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-    const result = await model.generateContent("Say 'Hello, I am working correctly!'");
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-2.5-pro-exp-03-25',
+    });
+    const result = await model.generateContent(
+      "Say 'Hello, I am working correctly!'",
+    );
     const response = result.response.text();
-    
-    console.log("=== GEMINI TEST RESPONSE ===");
-    console.log(response);
-    console.log("===========================");
-    
+
+    logWithTimestamp('Gemini test completed successfully', { response });
     return true;
   } catch (error) {
-    console.error("Error connecting to Gemini:", error);
-    if (error instanceof Error) {
-      console.error("Error details:", error.message);
-      console.error("Error stack:", error.stack);
-    }
+    logWithTimestamp('Error connecting to Gemini', { error });
     return false;
   }
-} 
+}
